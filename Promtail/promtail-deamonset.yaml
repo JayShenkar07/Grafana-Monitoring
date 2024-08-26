@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail-daemonset
+spec:
+  selector:
+    matchLabels:
+      name: promtail
+  template:
+    metadata:
+      labels:
+        name: promtail
+    spec:
+      serviceAccount: promtail-serviceaccount
+      containers:
+      - name: promtail-container
+        image: grafana/promtail
+        args:
+        - -config.file=/etc/promtail/promtail.yaml
+        env: 
+        - name: 'HOSTNAME' # needed when using kubernetes_sd_configs
+          valueFrom: 
+            fieldRef: 
+              fieldPath: 'spec.nodeName' 
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log
+        - name: promtail-config
+          mountPath: /etc/promtail
+        - mountPath: /var/lib/docker/containers
+          name: varlibdockercontainers
+          readOnly: true
+        - name: nginx-ingress-logs
+          mountPath: /var/log/nginx
+      volumes:
+      - name: logs
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: promtail-config
+        configMap:
+          name: promtail-config
+      - name: nginx-ingress-logs
+        hostPath:
+          path: /var/log/nginx
+
+#configmap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+data: 
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    clients:
+    - url: http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push 
+    
+    positions:
+      filename: /tmp/positions.yaml
+
+    target_config:
+      sync_period: 10s
+
+    scrape_configs:
+    - job_name: all-pods-namespace
+      kubernetes_sd_configs:
+        - role: pod
+      pipeline_stages:
+        - docker: {}
+      relabel_configs:
+        - source_labels:
+            - __meta_kubernetes_namespace
+          target_label: namespace
+        - source_labels:
+            - __meta_kubernetes_pod_name
+          target_label: pod
+        - source_labels:
+            - __meta_kubernetes_pod_container_name
+          target_label: container
+        - action: replace
+          replacement: /var/log/pods/*$1/*.log
+          separator: /
+          source_labels:
+            - __meta_kubernetes_pod_uid
+            - __meta_kubernetes_pod_container_name
+          target_label: __path__
+        - source_labels:
+            - __meta_kubernetes_namespace
+          action: keep
+          regex: auth360-namespace|bx360-namespace|cx360-namespace|mx360-namespace|onboarding360-namespace
+
+    - job_name: nginx-ingress
+      static_configs:
+        - targets:
+            - localhost
+          labels:
+            job: nginx-ingress
+            __path__: /var/log/nginx/*.log
+
+
+--- # Clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: promtail-clusterrole
+rules:
+  - apiGroups: [""]
+    resources:
+    - nodes
+    - services
+    - pods
+    verbs:
+    - get
+    - watch
+    - list
+
+--- # ServiceAccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail-serviceaccount
+
+--- # Rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: promtail-clusterrolebinding
+subjects:
+    - kind: ServiceAccount
+      name: promtail-serviceaccount
+      namespace: default
+roleRef:
+    kind: ClusterRole
+    name: promtail-clusterrole
+    apiGroup: rbac.authorization.k8s.io
